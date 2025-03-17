@@ -1,44 +1,62 @@
 import runpod
-import subprocess
-import shutil
+import demucs.separate
 import os
-import torch
+import requests
+import shutil
 
 def handler(event):
-    """ RunPod Serverless API için Demucs işleyici fonksiyonu """
-    job_id = event['id']
-    audio_url = event['input']['audio_url']
+    input_audio = event['input'].get('audio')
 
-    # Müzik dosyasını indir
-    os.system(f"wget -O musics/{job_id}.mp3 {audio_url}")
+    if not input_audio:
+        return {"error": "Audio URL is missing."}
 
-    # Demucs ile ayrıştırma işlemi
-    subprocess.run([
-        "demucs",
-        "--mp3",
-        "--two-stems",
-        "vocals",
-        "-n",
-        "mdx_extra",
-        f"musics/{job_id}.mp3",
-        "-o",
-        "musics"
-    ])
+    job_id = event.get("id", "unknown_job")
+    local_audio_path = f"/tmp/{job_id}.mp3"
 
-    # Çıktıları taşı
-    output_path = f"musics/{job_id}"
+    # Dosyayı indir
+    try:
+        response = requests.get(input_audio, stream=True)
+        if response.status_code == 200:
+            with open(local_audio_path, "wb") as audio_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    audio_file.write(chunk)
+        else:
+            return {"error": "Failed to download audio file."}
+    except Exception as e:
+        return {"error": f"Error downloading file: {str(e)}"}
+
+    # Demucs işlemi
+    output_folder = "/app/separated"
+    os.system(f"demucs -o {output_folder} {local_audio_path}")
+
+    # Yeni çıkış dizinini kontrol et
+    expected_path = f"{output_folder}/htdemucs/{job_id}"
+    old_expected_path = f"{output_folder}/mdx_extra/{job_id}"  # Eski model olabilir
+
+    # Hangi dizinde dosyalar var, onu kontrol et
+    if os.path.exists(expected_path):
+        vocal_path = f"{expected_path}/vocals.wav"
+        no_vocal_path = f"{expected_path}/no_vocals.wav"
+    elif os.path.exists(old_expected_path):
+        vocal_path = f"{old_expected_path}/vocals.wav"
+        no_vocal_path = f"{old_expected_path}/no_vocals.wav"
+    else:
+        return {"error": "Demucs output files not found."}
+
+    # Çıktıları yeni bir dizine taşıyalım
+    output_path = f"/app/musics/{job_id}"
     os.makedirs(output_path, exist_ok=True)
-    
-    shutil.move(f"musics/mdx_extra/{job_id}/vocals.mp3", f"{output_path}/vocals.mp3")
-    shutil.move(f"musics/mdx_extra/{job_id}/no_vocals.mp3", f"{output_path}/no_vocals.mp3")
-    shutil.rmtree(f"musics/mdx_extra")
 
-    torch.cuda.empty_cache()
+    try:
+        shutil.move(vocal_path, f"{output_path}/vocals.mp3")
+        shutil.move(no_vocal_path, f"{output_path}/no_vocals.mp3")
+    except FileNotFoundError:
+        return {"error": "Expected output files are missing after separation."}
 
     return {
-        "vocal_path": f"{output_path}/vocals.mp3",
-        "no_vocal_path": f"{output_path}/no_vocals.mp3"
+        "vocal": f"{output_path}/vocals.mp3",
+        "no_vocal": f"{output_path}/no_vocals.mp3"
     }
 
-if __name__ == '__main__':
-    runpod.serverless.start({'handler': handler})
+if __name__ == "__main__":
+    runpod.serverless.start({"handler": handler})
